@@ -1,8 +1,9 @@
 [package]
-name = "blink"
+name = "gpio"
 version = "0.1.0"
 authors = ["Axel Viala <axel.viala@darnuria.eu>"]
 edition = "2018"
 
 [dependencies]
 libc = "0.2"
+volatile-register = "0.2.0"

@@ -1,7 +1,12 @@
 
+use volatile_register::{RW, RO};
+
+// TODO use function from bcm_host
+// bcm_host_get_peripheral_address()
+
 // Base of peripherals and base of GPIO controller.
-const BCM2835_PERIPH_BASE: usize = 0x2000_0000;
-const BCM2835_GPIO_BASE:   usize   = BCM2835_PERIPH_BASE + 0x20_0000;
+const BCM2837_PERIPH_BASE: usize = 0x3F00_0000;
+const BCM2837_GPIO_BASE:   usize   = BCM2837_PERIPH_BASE + 0x20_0000;
 
 // Paging definitions.
 const RPI_PAGE_SIZE:  usize   = 4096;
@@ -10,24 +15,38 @@ const RPI_BLOCK_SIZE: usize  = 4096;
 
 // Helper macros for accessing GPIO registers.
 
-// enum Pin {
+// Memory layout of the gpio pins.
+#[repr(C)]
+pub struct Gpio {
+  fsel:   [RW<u32>; 7],
+  set:    [RW<u32>; 3],
+  clr:    [RW<u32>; 3],
+  lev:    [RO<u32>; 3],
+  eds:    [RW<u32>; 3],
+  ren:    [RW<u32>; 3],
+  fen:    [RW<u32>; 3],
+  hen:    [RW<u32>; 3],
+  len:    [RW<u32>; 3],
+  aren:   [RW<u32>; 3],
+  afen:   [RW<u32>; 3],
+  pud:    [RW<u32>; 1],
+  pudclk: [RW<u32>; 3],
+  test:   [RW<u32>; 1],
+}
 
+// impl Drop for Gpio {
+//   fn drop(&mut self) {
+//     println!("Hi i'am droping!");
+//     for i in 0..32 {
+//       self.write(i, false);
+//     }
+//     unsafe {
+//       libc::munmap((self as * mut Self) as (* mut libc::c_void), RPI_BLOCK_SIZE);
+//     }
+//   }
 // }
 
-// Utiliser un array statique de 0 à REG gpioMax?
-struct Gpio {
-    base_addr: *mut usize,
-    size: usize,
-}
-
-impl Drop for Gpio {
-  fn drop(&mut self) {
-    unsafe {
-      libc::munmap(self.base_addr as *mut libc::c_void, self.size);
-    }
-  }
-}
-
+// TODO rewrite with openOption and OpenOptionExt
 fn open_mem() -> Result<libc::c_int, &'static str> {
   if let Ok(filename) = std::ffi::CString::new("/dev/mem") {
     let mmap_fd = unsafe { 
@@ -42,23 +61,25 @@ fn open_mem() -> Result<libc::c_int, &'static str> {
       Ok(mmap_fd)
     }
   } else {
-    Err("Impossible to map gpio adress range")
+    Err("Cannot create CString")
   }
 }
 
+// Improve with https://rust-embedded.github.io/book/static-guarantees/design-contracts.html
 impl Gpio {
-  pub fn new() -> Result<Self, & 'static str> {
+  pub fn new<'a>() -> Result<&'a mut Self, & 'static str> {
   // Setup the access to memory-mapped I/O.
   let mmap_fd = open_mem()?;
 
   let base_addr = unsafe { 
     libc::mmap(
-    0 as *mut libc::c_void,
-    RPI_BLOCK_SIZE,
-    libc::PROT_READ | libc::PROT_WRITE,
-    libc::MAP_SHARED,
-    mmap_fd,
-    BCM2835_GPIO_BASE as i64)
+      0 as *mut libc::c_void,
+      RPI_BLOCK_SIZE,
+      libc::PROT_READ | libc::PROT_WRITE,
+      libc::MAP_SHARED,
+      mmap_fd,
+      BCM2837_GPIO_BASE as i32
+    )
   };
 
   // The file descriptor can be closed after mmaping see Posix doc mmap.
@@ -67,56 +88,60 @@ impl Gpio {
     return Err("Cannot setup mmapped GPIO.\n");
   }
 
-    Ok(Gpio { base_addr: base_addr as *mut usize, size: RPI_BLOCK_SIZE })
+    // Rust magic to convert pointer to static ref.
+    Ok( unsafe { &mut *(base_addr as *mut Gpio) })
   }
 
-  pub fn as_input(&self, gpio: isize) {
-      let p = offset_conf(self.base_addr, gpio);
-      unsafe { *p &= input_mask(gpio); }
+  pub fn as_input(&self, pin: usize) -> &Self {
+    let reg = pin / 10;
+    let bit = (pin % 10) * 3;
+    let mask = 0b111 << bit;
+    let val = self.fsel[reg].read() & !mask;
+    unsafe { self.fsel[reg].write(val); }
+    self
   }
 
-  pub fn as_output(&self, gpio: isize) {
-    self.as_input(gpio);
-    let p = offset_conf(self.base_addr, gpio);
-    unsafe { *p |= output_mask(gpio); }
+  pub fn as_output(&self, pin: usize) -> &Self{
+    let reg = pin / 10;
+    let bit = (pin % 10) * 3;
+    let mask = 0b111 << bit;
+    let val = (self.fsel[reg].read() & !mask) | ((1 << bit) & mask);
+    unsafe { self.fsel[reg].write(val); }
+    self
   }
 
-  pub fn write(&self, gpio: isize) {
-    assert!(gpio < 32, "Pin are between 0 and 32.");
-    let p = offset_register(self.base_addr, 0b000_1100, gpio);
-    unsafe { *p = 1 << gpio };
+  pub fn write(&self, pin: usize, val: bool) {
+    assert!(pin < 32, "There is less than 32 pin on the raspberryPi");
+    if val {
+      unsafe { self.set[pin / 32].write(1 << pin); }
+    } else {
+      unsafe { self.clr[pin / 32].write(1 << pin); }
+    }
   }
 
-  pub fn clear(&self, gpio: isize) {
-    assert!(gpio < 32, "Pin are between 0 and 32.");
-    let p = offset_register(self.base_addr, 0b0010_1000, gpio);
-    unsafe { *p = 1 << gpio }
+  pub fn read(&self, pin: usize) -> u32 {
+    self.lev[pin].read() >> pin & 0x1
   }
-
-  pub fn read(&self, gpio: isize) -> usize {
-    let p = offset_register(self.base_addr, 0b0011_0100, gpio);
-    unsafe { *p >> gpio & 0x1 }
-  }
-}
-
-fn offset_conf(ptr: *mut usize , gpio: isize) -> *mut usize {
-  unsafe { ptr.offset(gpio / 10) }
-}
-
-fn output_mask(gpio: isize) -> usize {
-  0x1 << ((gpio % 10) * 3)
-}
-    
-fn input_mask(gpio: isize) -> usize {
-  !( 0x7 << ( gpio % 10) * 3)
-}
-
-fn offset_register(ptr: *mut usize, addr: isize, gpio: isize) -> *mut usize {
-  let base_addr = addr / std::mem::size_of::<isize>() as isize;
-  unsafe { ptr.offset(base_addr + (gpio / 32)) }
 }
 
 fn main() {
-  println!("Hello, world!");
-  let gpio = Gpio::new();
+  println!("Hello gpio");
+  let gpio = Gpio::new().unwrap();
+  gpio.as_output(3).as_output(4);
+  let mut val = true;
+  let ten_millis = std::time::Duration::from_millis(100);
+  for _ in 0..16 {
+    val = !val;
+    gpio.write(3, !val);
+    gpio.write(4, val);
+    std::thread::sleep(ten_millis);
+  }
+
+  // Closing todo: Move inside drop need refatoring.
+  for i in 0..32 {
+      gpio.write(i, false);
+  }
+  unsafe {
+    libc::munmap((gpio as * mut Gpio) as (* mut libc::c_void), RPI_BLOCK_SIZE);
+  }
 }
